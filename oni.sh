@@ -95,6 +95,24 @@ DEPLOY TYPES:
     loadbalancer    - Deploy with Load Balancer (direct service update)
     worker          - Deploy without Load Balancer (worker/batch processes)
 
+ECS SERVICE CONNECT (oni.yaml):
+    To enable ECS Service Connect on a service, add APP_SERVICE_CONNECT under the app config.
+    This adds the required 'name' and 'appProtocol' fields to the first port mapping in the
+    task definition, which is mandatory for Service Connect to work.
+
+    APP_SERVICE_CONNECT:
+      PORT_NAME: "nodejs-80-tcp"    # required: must match the portName in serviceConnectConfiguration
+      APP_PROTOCOL: "http"          # optional: http | http2 | grpc (default: http)
+
+    Example oni.yaml snippet:
+      production:
+        my-api:
+          APP_PORTS:
+            - 80
+          APP_SERVICE_CONNECT:
+            PORT_NAME: "nodejs-80-tcp"
+            APP_PROTOCOL: "http"
+
 EXAMPLES:
     # Deploy with CodeDeploy
     bobctl.sh deploy -n api -t 1.0.0 -d codedeploy -f
@@ -571,17 +589,54 @@ build_secrets() {
 }
 
 # Function to build port mappings JSON
+# Supports ECS Service Connect via APP_SERVICE_CONNECT in oni.yaml:
+#   APP_SERVICE_CONNECT:
+#     PORT_NAME: "nodejs-80-tcp"      # required: name for the port mapping (must match serviceConnect portName)
+#     APP_PROTOCOL: "http"            # optional: http | http2 | grpc (default: http)
 build_port_mappings() {
     local ports="[]"
-    
+
     if command -v yq &> /dev/null; then
-        local ports_array=$(yq eval ".${ENVIRONMENT}.${APP_NAME}.APP_PORTS[]" "$CONFIG_FILE" 2>/dev/null)
-        
+        local ports_array
+        ports_array=$(yq eval ".${ENVIRONMENT}.${APP_NAME}.APP_PORTS[]" "$CONFIG_FILE" 2>/dev/null)
+
         if [ -n "$ports_array" ] && [ "$ports_array" != "null" ]; then
-            ports=$(echo "$ports_array" | jq -R -s 'split("\n") | map(select(length > 0) | tonumber) | map({containerPort: .})')
+            # Check if APP_SERVICE_CONNECT is configured
+            local sc_port_name
+            local sc_app_protocol
+            sc_port_name=$(yq eval ".${ENVIRONMENT}.${APP_NAME}.APP_SERVICE_CONNECT.PORT_NAME" "$CONFIG_FILE" 2>/dev/null)
+            sc_app_protocol=$(yq eval ".${ENVIRONMENT}.${APP_NAME}.APP_SERVICE_CONNECT.APP_PROTOCOL" "$CONFIG_FILE" 2>/dev/null)
+
+            [ "$sc_port_name" = "null" ] && sc_port_name=""
+            [ "$sc_app_protocol" = "null" ] && sc_app_protocol=""
+            [ -z "$sc_app_protocol" ] && sc_app_protocol="http"
+
+            if [ -n "$sc_port_name" ]; then
+                # Service Connect: first port gets name + appProtocol; remaining ports are plain
+                local first_port=true
+                ports="["
+                while IFS= read -r port; do
+                    [ -z "$port" ] && continue
+                    if [ "$first_port" = true ]; then
+                        ports+=$(jq -n \
+                            --argjson p "$(echo "$port" | tr -d '[:space:]')" \
+                            --arg name "$sc_port_name" \
+                            --arg proto "$sc_app_protocol" \
+                            '{containerPort: $p, name: $name, appProtocol: $proto}')
+                        first_port=false
+                    else
+                        ports+=","
+                        ports+=$(jq -n --argjson p "$(echo "$port" | tr -d '[:space:]')" '{containerPort: $p}')
+                    fi
+                done <<< "$ports_array"
+                ports+="]"
+            else
+                # No Service Connect: plain port mappings
+                ports=$(echo "$ports_array" | jq -R -s 'split("\n") | map(select(length > 0) | tonumber) | map({containerPort: .})')
+            fi
         fi
     fi
-    
+
     echo "$ports"
 }
 
